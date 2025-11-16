@@ -1,0 +1,15 @@
+[Unit]
+Description=Processus Resistant Auto-Relancable
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/resistant_daemon
+Restart=always
+RestartSec=1
+User=root
+StandardOutput=append:/var/log/resistant.log
+StandardError=append:/var/log/resistant.log
+
+[Install]
+WantedBy=multi-user.target
